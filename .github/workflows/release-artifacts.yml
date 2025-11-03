@@ -1,25 +1,35 @@
-name: Build & upload Linux release artifacts (Makefile)
+name: Build & upload release artifacts (Makefile)
 
 on:
   release:
     types: [published]
 
 permissions:
-  contents: write  # needed to upload assets to the GitHub Release
+  contents: write
 
 jobs:
-  build-linux:
+  build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]  # Linux only
+        include:
+          # Linux
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          # macOS
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Makefile uses git tags for VERSION
+          fetch-depth: 0  # Makefile reads tags
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -34,27 +44,30 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build via Makefile (linux/${{ matrix.arch }})
+      - name: Build via Makefile (${{ matrix.goos }}/${{ matrix.goarch }})
         env:
-          CGO_ENABLED: "0"
-          GOOS: linux
-          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"          # ensure pure-Go for cross-compile
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
           make build
-          test -f ./gitleaks  # ensure binary exists
+          test -f ./gitleaks
 
       - name: Package artifact
         id: pkg
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
-          ARCH="${{ matrix.arch }}"
-          PKG="gitleaks_${VERSION}_linux_${ARCH}"
+          GOOS="${{ matrix.goos }}"
+          GOARCH="${{ matrix.goarch }}"
+          PKG="gitleaks_${VERSION}_${GOOS}_${GOARCH}"
+
           mkdir -p "dist/$PKG"
           cp ./gitleaks "dist/$PKG/gitleaks"
           [ -f LICENSE ] && cp LICENSE "dist/$PKG/"
           [ -f README.md ] && cp README.md "dist/$PKG/"
+
           (cd dist && tar -czf "$PKG.tar.gz" "$PKG")
           echo "asset=dist/$PKG.tar.gz" >> "$GITHUB_OUTPUT"
 
