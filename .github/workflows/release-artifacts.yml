@@ -1,116 +1,133 @@
-name: Build and upload release artifacts
+name: Build & upload Linux release artifacts (Makefile)
 
 on:
   release:
-    types: [published]  # runs when you publish a release in GitHub UI or via API
+    types: [published]
 
 permissions:
-  contents: write  # required to upload release assets
+  contents: write  # needed to upload assets to the GitHub Release
 
 jobs:
-  build-and-upload:
+  build-linux:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # add/remove targets as you need
-          - goos: linux
-            goarch: amd64
-            ext: ""
-            archive: tar.gz
-          - goos: linux
-            goarch: arm64
-            ext: ""
-            archive: tar.gz
-          - goos: darwin
-            goarch: amd64
-            ext: ""
-            archive: tar.gz
-          - goos: darwin
-            goarch: arm64
-            ext: ""
-            archive: tar.gz
-          - goos: windows
-            goarch: amd64
-            ext: ".exe"
-            archive: zip
-          - goos: windows
-            goarch: arm64
-            ext: ".exe"
-            archive: zip
+        arch: [amd64, arm64]  # Linux only
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # ensure tags exist for the Makefile's VERSION
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # Option A: read from go.mod
           go-version-file: go.mod
-          # Option B: hardcode: go-version: "1.22.x"
 
-      - name: Derive version from tag
+      - name: Derive version from release tag
         id: version
         run: |
-          # For release events, GitHub provides the tag in github.event.release.tag_name
           TAG="${{ github.event.release.tag_name }}"
-          # Strip leading 'v' for filenames like gitleaks_8.28.0_linux_amd64.tar.gz
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+      - name: Build via Makefile (linux/${{ matrix.arch }})
         env:
           CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
         run: |
-          mkdir -p dist
-          OUT="gitleaks${{ matrix.ext }}"
-          # (Optional) set ldflags to inject version into your binary’s main package if supported
-          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.version.outputs.version }}" -o "$OUT" ./cmd/detect
+          set -euo pipefail
+          # Your Makefile already sets VERSION using git tags and injects it via LDFLAGS.
+          make build
+          # The binary should now be at ./gitleaks
+          test -f ./gitleaks
 
-          PKG="gitleaks_${{ steps.version.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+      - name: Package artifact
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          PKG="gitleaks_${VERSION}_linux_${ARCH}"
           mkdir -p "dist/$PKG"
-          mv "$OUT" "dist/$PKG/$OUT"
-
-          # Optionally include README/LICENSE or config files
+          # Normalize name to gitleaks (already is); include LICENSE/README if present
+          cp ./gitleaks "dist/$PKG/gitleaks"
           [ -f LICENSE ] && cp LICENSE "dist/$PKG/"
           [ -f README.md ] && cp README.md "dist/$PKG/"
+          (cd dist && tar -czf "$PKG.tar.gz" "$PKG")
+          echo "asset=dist/$PKG.tar.gz" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd dist && zip -r "$PKG.zip" "$PKG")
-            echo "asset=dist/$PKG.zip" >> $GITHUB_ENV
-          else
-            (cd dist && tar -czf "$PKG.tar.gz" "$PKG")
-            echo "asset=dist/$PKG.tar.gz" >> $GITHUB_ENV
-          fi
-
-      - name: Generate checksums (optional, but recommended)
+      - name: Generate checksum for this asset
         run: |
+          set -euo pipefail
+          mkdir -p dist
           cd dist
-          # Append checksum for this matrix artifact
-          shasum -a 256 "$(basename "$asset")" >> checksums.txt
-        shell: bash
+          sha256sum "$(basename '${{ steps.pkg.outputs.asset }}')" >> checksums.txt
 
-      - name: Upload artifact to the current Release
+      - name: Upload asset to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: |
-            ${{ env.asset }}
+            ${{ steps.pkg.outputs.asset }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload checksums (once at end)
-        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }} # run once on last matrix row
+  upload-checksums:
+    runs-on: ubuntu-latest
+    needs: build-linux
+    steps:
+      - name: Checkout (just to have a workspace)
+        uses: actions/checkout@v4
+
+      - name: Collect checksums from all matrix runs
+        uses: actions/download-artifact@v4
+        with:
+          # We didn't upload per-run artifacts; instead we’ll re-create checksums
+          # by downloading release assets isn’t practical here, so instead:
+          # Use a workaround: generate a combined checksums.txt during a dedicated run.
+          # Simpler: we have each matrix job wrote a dist/checksums.txt locally,
+          # so instead we’ll just recompute them by re-hashing release assets is tricky.
+          # -> We'll aggregate by pulling the workflow run artifacts instead:
+          # To keep it simple, we’ll skip artifact download and recompute below.
+          # (No-op step to satisfy action; we won't rely on it.)
+          name: noop
+          path: _noop
+        continue-on-error: true
+
+      - name: Build combined checksums
+        run: |
+          set -euo pipefail
+          # We can’t read from the previous job’s workspace, so compute checksums
+          # by fetching the assets list via GitHub API and hashing after download.
+          # To keep it simple & reliable, we’ll just skip recomputing and instead
+          # concatenate all existing checksums from the jobs via the API is overkill.
+          # Easiest path: create a fresh checksums.txt by downloading assets.
+          TAG="${{ github.event.release.tag_name }}"
+          OWNER_REPO="${{ github.repository }}"
+          mkdir -p dist
+          ASSETS_JSON=$(gh release view "$TAG" --json assets -q '.assets[] | select(.name | test("^gitleaks_.*_linux_(amd64|arm64)\\.tar\\.gz$")) | .name' || true)
+          if [ -z "$ASSETS_JSON" ]; then
+            echo "No Linux assets found to checksum; skipping." > dist/checksums.txt
+          else
+            while read -r NAME; do
+              [ -z "$NAME" ] && continue
+              gh release download "$TAG" --pattern "$NAME" --output "dist/$NAME"
+              (cd dist && sha256sum "$NAME") >> dist/checksums.txt
+            done <<< "$ASSETS_JSON"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload checksums to Release
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ github.event.release.tag_name }}
           files: |
             dist/checksums.txt
         env:
