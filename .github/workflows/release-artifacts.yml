@@ -58,4 +58,60 @@ jobs:
         run: |
           # For release events, GitHub provides the tag in github.event.release.tag_name
           TAG="${{ github.event.release.tag_name }}"
-          # Strip leading 'v' for filenam
+          # Strip leading 'v' for filenames like gitleaks_8.28.0_linux_amd64.tar.gz
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          OUT="gitleaks${{ matrix.ext }}"
+          # (Optional) set ldflags to inject version into your binary’s main package if supported
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.version.outputs.version }}" -o "$OUT" ./cmd/gitleaks
+
+          PKG="gitleaks_${{ steps.version.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          mkdir -p "dist/$PKG"
+          mv "$OUT" "dist/$PKG/$OUT"
+
+          # Optionally include README/LICENSE or config files
+          [ -f LICENSE ] && cp LICENSE "dist/$PKG/"
+          [ -f README.md ] && cp README.md "dist/$PKG/"
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && zip -r "$PKG.zip" "$PKG")
+            echo "asset=dist/$PKG.zip" >> $GITHUB_ENV
+          else
+            (cd dist && tar -czf "$PKG.tar.gz" "$PKG")
+            echo "asset=dist/$PKG.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Generate checksums (optional, but recommended)
+        run: |
+          cd dist
+          # Append checksum for this matrix artifact
+          shasum -a 256 "$(basename "$asset")" >> checksums.txt
+        shell: bash
+
+      - name: Upload artifact to the current Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: |
+            ${{ env.asset }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload checksums (once at end)
+        if: ${{ matrix.goos == 'windows' && matrix.goarch == 'arm64' }} # run once on last matrix row
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: |
+            dist/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
