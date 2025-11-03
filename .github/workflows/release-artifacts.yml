@@ -19,7 +19,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # ensure tags exist for the Makefile's VERSION
+          fetch-depth: 0  # Makefile uses git tags for VERSION
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -41,10 +41,8 @@ jobs:
           GOARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          # Your Makefile already sets VERSION using git tags and injects it via LDFLAGS.
           make build
-          # The binary should now be at ./gitleaks
-          test -f ./gitleaks
+          test -f ./gitleaks  # ensure binary exists
 
       - name: Package artifact
         id: pkg
@@ -54,81 +52,16 @@ jobs:
           ARCH="${{ matrix.arch }}"
           PKG="gitleaks_${VERSION}_linux_${ARCH}"
           mkdir -p "dist/$PKG"
-          # Normalize name to gitleaks (already is); include LICENSE/README if present
           cp ./gitleaks "dist/$PKG/gitleaks"
           [ -f LICENSE ] && cp LICENSE "dist/$PKG/"
           [ -f README.md ] && cp README.md "dist/$PKG/"
           (cd dist && tar -czf "$PKG.tar.gz" "$PKG")
           echo "asset=dist/$PKG.tar.gz" >> "$GITHUB_OUTPUT"
 
-      - name: Generate checksum for this asset
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cd dist
-          sha256sum "$(basename '${{ steps.pkg.outputs.asset }}')" >> checksums.txt
-
       - name: Upload asset to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          files: |
-            ${{ steps.pkg.outputs.asset }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  upload-checksums:
-    runs-on: ubuntu-latest
-    needs: build-linux
-    steps:
-      - name: Checkout (just to have a workspace)
-        uses: actions/checkout@v4
-
-      - name: Collect checksums from all matrix runs
-        uses: actions/download-artifact@v4
-        with:
-          # We didn't upload per-run artifacts; instead we’ll re-create checksums
-          # by downloading release assets isn’t practical here, so instead:
-          # Use a workaround: generate a combined checksums.txt during a dedicated run.
-          # Simpler: we have each matrix job wrote a dist/checksums.txt locally,
-          # so instead we’ll just recompute them by re-hashing release assets is tricky.
-          # -> We'll aggregate by pulling the workflow run artifacts instead:
-          # To keep it simple, we’ll skip artifact download and recompute below.
-          # (No-op step to satisfy action; we won't rely on it.)
-          name: noop
-          path: _noop
-        continue-on-error: true
-
-      - name: Build combined checksums
-        run: |
-          set -euo pipefail
-          # We can’t read from the previous job’s workspace, so compute checksums
-          # by fetching the assets list via GitHub API and hashing after download.
-          # To keep it simple & reliable, we’ll just skip recomputing and instead
-          # concatenate all existing checksums from the jobs via the API is overkill.
-          # Easiest path: create a fresh checksums.txt by downloading assets.
-          TAG="${{ github.event.release.tag_name }}"
-          OWNER_REPO="${{ github.repository }}"
-          mkdir -p dist
-          ASSETS_JSON=$(gh release view "$TAG" --json assets -q '.assets[] | select(.name | test("^gitleaks_.*_linux_(amd64|arm64)\\.tar\\.gz$")) | .name' || true)
-          if [ -z "$ASSETS_JSON" ]; then
-            echo "No Linux assets found to checksum; skipping." > dist/checksums.txt
-          else
-            while read -r NAME; do
-              [ -z "$NAME" ] && continue
-              gh release download "$TAG" --pattern "$NAME" --output "dist/$NAME"
-              (cd dist && sha256sum "$NAME") >> dist/checksums.txt
-            done <<< "$ASSETS_JSON"
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload checksums to Release
-        if: always()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: |
-            dist/checksums.txt
+          files: ${{ steps.pkg.outputs.asset }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
